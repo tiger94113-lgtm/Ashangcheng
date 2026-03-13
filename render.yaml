@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: asset-mall-backend
+    runtime: go
+    plan: free
+    buildCommand: go build -o main .
+    startCommand: ./main
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: GO_VERSION
+        value: 1.21
+    healthCheckPath: /api/health
