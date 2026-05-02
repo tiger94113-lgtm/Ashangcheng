@@ -1,7 +1,7 @@
 //@version=5
 // Converted to strategy from indicator logic (core signal + risk + execution).
 
-strategy("顶底二次买卖点 - 量化策略", overlay=true, max_bars_back=5000, precision=4, format=format.inherit, pyramiding=0, initial_capital=100000, default_qty_type=strategy.cash, default_qty_value=1000, commission_type=strategy.commission.percent, commission_value=0.05)
+strategy("顶底二次买卖点 - 量化策略", overlay=true, max_bars_back=5000, precision=4, format=format.inherit, pyramiding=0, initial_capital=100000, default_qty_type=strategy.cash, default_qty_value=1000, commission_type=strategy.commission.percent, commission_value=0.05, process_orders_on_close=true)
 
 // ═══════════════════════════════════════════════════════════
 // GROUP 1 — CORE SIGNAL MODE
@@ -62,8 +62,8 @@ closeOnFlip   = input.bool(true, "Close on Opposite Signal", group=groupExec)
 tradeSizeUSD  = input.float(1000.0, "Order Size (USD)", minval=1, step=1, group=groupExec)
 usePercSL     = input.bool(false, "Use Percent Stop", group=groupExec)
 percSL        = input.float(1.0, "Percent Stop (%)", minval=0.1, step=0.1, group=groupExec)
-stopMultATR   = input.float(1.0, "ATR Stop (xATR)", minval=0.3, maxval=5.0, step=0.05, group=groupExec)
-tpMultATR     = input.float(2.0, "ATR Target (xATR)", minval=0.5, maxval=10.0, step=0.05, group=groupExec)
+stopMultATR   = input.float(1.2, "ATR Stop (xATR)", minval=0.3, maxval=5.0, step=0.05, group=groupExec)
+tpMultATR     = input.float(2.4, "ATR Target (xATR)", minval=0.5, maxval=10.0, step=0.05, group=groupExec)
 
 // ═══════════════════════════════════════════════════════════
 // GROUP 7 — RISK GUARD
@@ -75,6 +75,27 @@ baseCooldownBars      = input.int(5, "Base Pause After Loss", minval=0, maxval=5
 maxConsecutiveLosses  = input.int(3, "Streak Limit", minval=1, maxval=10, group=groupRisk)
 enableDynamicCooldown = input.bool(true, "Scale Pause by Loss Size", group=groupRisk)
 enforceRiskOnSignals  = input.bool(true, "Enforce on Final Signals", group=groupRisk)
+
+// ═══════════════════════════════════════════════════════════
+// GROUP 8 — DRAWDOWN CONTROL
+// ═══════════════════════════════════════════════════════════
+groupDD = "⑧ Drawdown Control"
+useTrendFilter   = input.bool(true, "Trend Filter (EMA)", group=groupDD)
+trendEmaLen      = input.int(200, "Trend EMA Length", minval=20, maxval=500, group=groupDD)
+useAdxFilter     = input.bool(true, "ADX Filter", group=groupDD)
+adxLen           = input.int(14, "ADX Length", minval=5, maxval=50, group=groupDD)
+adxMin           = input.float(18.0, "Min ADX", minval=5, maxval=50, step=0.5, group=groupDD)
+useAtrRegime     = input.bool(true, "ATR Regime Filter", group=groupDD)
+atrRegimeLen     = input.int(100, "ATR Baseline Length", minval=20, maxval=500, group=groupDD)
+minAtrRatio      = input.float(0.7, "Min ATR Ratio", minval=0.2, maxval=2.0, step=0.05, group=groupDD)
+maxAtrRatio      = input.float(2.2, "Max ATR Ratio", minval=0.5, maxval=5.0, step=0.05, group=groupDD)
+enableBreakEven  = input.bool(true, "Break-even Stop", group=groupDD)
+breakEvenAtR     = input.float(1.0, "Trigger at R", minval=0.5, maxval=5.0, step=0.1, group=groupDD)
+breakEvenBufATR  = input.float(0.05, "Break-even Buffer (xATR)", minval=0.0, maxval=1.0, step=0.01, group=groupDD)
+enableTrailStop  = input.bool(true, "ATR Trailing Stop", group=groupDD)
+trailMultATR     = input.float(1.5, "Trailing Stop (xATR)", minval=0.3, maxval=5.0, step=0.05, group=groupDD)
+enableTimeExit   = input.bool(true, "Max Holding Bars", group=groupDD)
+maxBarsInTrade   = input.int(60, "Exit After N Bars", minval=5, maxval=500, group=groupDD)
 
 // ═══════════════════════════════════════════════════════════
 // UTILITIES
@@ -122,6 +143,10 @@ src = switch sourceType
 sigAtrLen = int(clamp(atrPeriod, 5, 200))
 [rTrendSig, rUpSig, rDnSig] = getSupertrend_var(src, multiplier, sigAtrLen, useATR)
 atrValueSig = useATR ? rma_var(ta.tr, sigAtrLen) : ema_var(ta.tr, sigAtrLen)
+trendEma = ta.ema(close, trendEmaLen)
+[_, __, adxVal] = ta.dmi(adxLen, adxLen)
+atrBase = ta.sma(atrValueSig, atrRegimeLen)
+atrRatio = atrBase > 0 ? atrValueSig / atrBase : 1.0
 
 // ═══════════════════════════════════════════════════════════
 // SIGNAL GENERATION (CORE FROM ORIGINAL INDICATOR)
@@ -158,6 +183,16 @@ buyFilters           = rsiColdCond and (not requireVolSpike or volSurge_sig)
 sellFilters          = rsiHotCond and (not requireVolSpike or volSurge_sig)
 buyBreakoutFilters   = rsiBullCond and (not requireVolSpike or volSurge_sig)
 sellBreakoutFilters  = rsiBearCond and (not requireVolSpike or volSurge_sig)
+
+longContextOK =
+ (not useTrendFilter or close > trendEma) and
+ (not useAdxFilter or adxVal >= adxMin) and
+ (not useAtrRegime or (atrRatio >= minAtrRatio and atrRatio <= maxAtrRatio))
+
+shortContextOK =
+ (not useTrendFilter or close < trendEma) and
+ (not useAdxFilter or adxVal >= adxMin) and
+ (not useAtrRegime or (atrRatio >= minAtrRatio and atrRatio <= maxAtrRatio))
 
 // ═══════════════════════════════════════════════════════════
 // RISK GUARD STATE
@@ -246,27 +281,60 @@ if barstate.isconfirmed and (buySignal or sellSignal)
 // ═══════════════════════════════════════════════════════════
 // STRATEGY ORDERS
 // ═══════════════════════════════════════════════════════════
-qty = tradeSizeUSD / close
+qty = close > 0 ? tradeSizeUSD / close : 0.0
 
-if buySignal and allowLong
+var int longEntryBar = na
+var int shortEntryBar = na
+var float highSinceEntry = na
+var float lowSinceEntry = na
+
+if buySignal and allowLong and longContextOK and qty > 0
     if closeOnFlip and strategy.position_size < 0
         strategy.close("Short", comment="Flip to Long")
     strategy.entry("Long", strategy.long, qty=qty, comment="Buy")
 
-if sellSignal and allowShort
+if sellSignal and allowShort and shortContextOK and qty > 0
     if closeOnFlip and strategy.position_size > 0
         strategy.close("Long", comment="Flip to Short")
     strategy.entry("Short", strategy.short, qty=qty, comment="Sell")
 
 if strategy.position_size > 0
-    longStop = usePercSL ? strategy.position_avg_price * (1.0 - percSL / 100.0) : strategy.position_avg_price - stopMultATR * atrValueSig
+    longEntryBar := na(longEntryBar) ? bar_index : longEntryBar
+    highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
+    lowSinceEntry := na
+    longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
+    longStop = strategy.position_avg_price - longRisk
+    if enableBreakEven and close >= strategy.position_avg_price + longRisk * breakEvenAtR
+        longStop := math.max(longStop, strategy.position_avg_price + breakEvenBufATR * atrValueSig)
+    if enableTrailStop
+        trailStopL = highSinceEntry - trailMultATR * atrValueSig
+        longStop := math.max(longStop, trailStopL)
     longTp   = strategy.position_avg_price + tpMultATR * atrValueSig
     strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTp, comment="L-TP/SL")
+    if enableTimeExit and not na(longEntryBar) and (bar_index - longEntryBar >= maxBarsInTrade)
+        strategy.close("Long", comment="L-TimeExit")
 
 if strategy.position_size < 0
-    shortStop = usePercSL ? strategy.position_avg_price * (1.0 + percSL / 100.0) : strategy.position_avg_price + stopMultATR * atrValueSig
+    shortEntryBar := na(shortEntryBar) ? bar_index : shortEntryBar
+    lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
+    highSinceEntry := na
+    shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
+    shortStop = strategy.position_avg_price + shortRisk
+    if enableBreakEven and close <= strategy.position_avg_price - shortRisk * breakEvenAtR
+        shortStop := math.min(shortStop, strategy.position_avg_price - breakEvenBufATR * atrValueSig)
+    if enableTrailStop
+        trailStopS = lowSinceEntry + trailMultATR * atrValueSig
+        shortStop := math.min(shortStop, trailStopS)
     shortTp   = strategy.position_avg_price - tpMultATR * atrValueSig
     strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTp, comment="S-TP/SL")
+    if enableTimeExit and not na(shortEntryBar) and (bar_index - shortEntryBar >= maxBarsInTrade)
+        strategy.close("Short", comment="S-TimeExit")
+
+if strategy.position_size == 0
+    longEntryBar := na
+    shortEntryBar := na
+    highSinceEntry := na
+    lowSinceEntry := na
 
 // ═══════════════════════════════════════════════════════════
 // PLOTS & ALERTS
@@ -276,6 +344,7 @@ plot(rTrendSig == -1 ? rDnSig : na, "Bear Band", color=color.new(color.red, 20))
 
 plotshape(buySignal, title="Long Entry", location=location.belowbar, style=shape.labelup, text="Buy ▲", size=size.small, color=color.new(color.teal, 0), textcolor=color.white)
 plotshape(sellSignal, title="Short Entry", location=location.abovebar, style=shape.labeldown, text="Sell ▼", size=size.small, color=color.new(color.red, 0), textcolor=color.white)
+plot(useTrendFilter ? trendEma : na, "Trend EMA", color=color.new(color.yellow, 0))
 
 alertcondition(buySignal, title="Long Alert", message="Vertex Pulse Strategy: Long Entry Detected")
 alertcondition(sellSignal, title="Short Alert", message="Vertex Pulse Strategy: Short Entry Detected")
