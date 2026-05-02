@@ -80,7 +80,7 @@ enforceRiskOnSignals  = input.bool(true, "Enforce on Final Signals", group=group
 // GROUP 8 — DRAWDOWN CONTROL
 // ═══════════════════════════════════════════════════════════
 groupDD = "⑧ Drawdown Control"
-ddMode           = input.string("Off (Legacy)", "Control Mode", options=["Off (Legacy)", "Light", "Strict"], group=groupDD)
+ddMode           = input.string("Light", "Control Mode", options=["Off (Legacy)", "Light", "Strict"], group=groupDD)
 useTrendFilter   = input.bool(true, "Trend Filter (EMA)", group=groupDD)
 trendEmaLen      = input.int(200, "Trend EMA Length", minval=20, maxval=500, group=groupDD)
 useAdxFilter     = input.bool(true, "ADX Filter", group=groupDD)
@@ -302,13 +302,18 @@ var int longEntryBar = na
 var int shortEntryBar = na
 var float highSinceEntry = na
 var float lowSinceEntry = na
+var float longEntryATR = na
+var float shortEntryATR = na
 
-if buySignal and allowLong and longContextOK and qty > 0
+buyEntrySignal = buySignal and longContextOK
+sellEntrySignal = sellSignal and shortContextOK
+
+if buyEntrySignal and allowLong and qty > 0
     if closeOnFlip and strategy.position_size < 0
         strategy.close("Short", comment="Flip to Long")
     strategy.entry("Long", strategy.long, qty=qty, comment="Buy")
 
-if sellSignal and allowShort and shortContextOK and qty > 0
+if sellEntrySignal and allowShort and qty > 0
     if closeOnFlip and strategy.position_size > 0
         strategy.close("Long", comment="Flip to Short")
     strategy.entry("Short", strategy.short, qty=qty, comment="Sell")
@@ -317,14 +322,15 @@ if strategy.position_size > 0
     longEntryBar := na(longEntryBar) ? bar_index : longEntryBar
     highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
     lowSinceEntry := na
-    longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
+    longEntryATR := na(longEntryATR) ? atrValueSig : longEntryATR
+    longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * longEntryATR
     longStop = strategy.position_avg_price - longRisk
     if not ddOff and enableBreakEven and close >= strategy.position_avg_price + longRisk * breakEvenAtREff
         longStop := math.max(longStop, strategy.position_avg_price + breakEvenBufATR * atrValueSig)
     if not ddOff and enableTrailStop
         trailStopL = highSinceEntry - trailMultEff * atrValueSig
         longStop := math.max(longStop, trailStopL)
-    longTp   = strategy.position_avg_price + tpMultATR * atrValueSig
+    longTp   = strategy.position_avg_price + tpMultATR * longEntryATR
     strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTp, comment="L-TP/SL")
     if not ddOff and enableTimeExit and not na(longEntryBar) and (bar_index - longEntryBar >= maxBarsInTradeEff)
         strategy.close("Long", comment="L-TimeExit")
@@ -333,14 +339,15 @@ if strategy.position_size < 0
     shortEntryBar := na(shortEntryBar) ? bar_index : shortEntryBar
     lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
     highSinceEntry := na
-    shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
+    shortEntryATR := na(shortEntryATR) ? atrValueSig : shortEntryATR
+    shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * shortEntryATR
     shortStop = strategy.position_avg_price + shortRisk
     if not ddOff and enableBreakEven and close <= strategy.position_avg_price - shortRisk * breakEvenAtREff
         shortStop := math.min(shortStop, strategy.position_avg_price - breakEvenBufATR * atrValueSig)
     if not ddOff and enableTrailStop
         trailStopS = lowSinceEntry + trailMultEff * atrValueSig
         shortStop := math.min(shortStop, trailStopS)
-    shortTp   = strategy.position_avg_price - tpMultATR * atrValueSig
+    shortTp   = strategy.position_avg_price - tpMultATR * shortEntryATR
     strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTp, comment="S-TP/SL")
     if not ddOff and enableTimeExit and not na(shortEntryBar) and (bar_index - shortEntryBar >= maxBarsInTradeEff)
         strategy.close("Short", comment="S-TimeExit")
@@ -350,6 +357,8 @@ if strategy.position_size == 0
     shortEntryBar := na
     highSinceEntry := na
     lowSinceEntry := na
+    longEntryATR := na
+    shortEntryATR := na
 
 // ═══════════════════════════════════════════════════════════
 // PLOTS & ALERTS
@@ -357,9 +366,9 @@ if strategy.position_size == 0
 plot(rTrendSig == 1 ? rUpSig : na, "Bull Band", color=color.new(color.teal, 20))
 plot(rTrendSig == -1 ? rDnSig : na, "Bear Band", color=color.new(color.red, 20))
 
-plotshape(buySignal, title="Long Entry", location=location.belowbar, style=shape.labelup, text="Buy ▲", size=size.small, color=color.new(color.teal, 0), textcolor=color.white)
-plotshape(sellSignal, title="Short Entry", location=location.abovebar, style=shape.labeldown, text="Sell ▼", size=size.small, color=color.new(color.red, 0), textcolor=color.white)
+plotshape(buyEntrySignal, title="Long Entry", location=location.belowbar, style=shape.labelup, text="Buy ▲", size=size.small, color=color.new(color.teal, 0), textcolor=color.white)
+plotshape(sellEntrySignal, title="Short Entry", location=location.abovebar, style=shape.labeldown, text="Sell ▼", size=size.small, color=color.new(color.red, 0), textcolor=color.white)
 plot(useTrendFilter ? trendEma : na, "Trend EMA", color=color.new(color.yellow, 0))
 
-alertcondition(buySignal, title="Long Alert", message="Vertex Pulse Strategy: Long Entry Detected")
-alertcondition(sellSignal, title="Short Alert", message="Vertex Pulse Strategy: Short Entry Detected")
+alertcondition(buyEntrySignal, title="Long Alert", message="Vertex Pulse Strategy: Long Entry Detected")
+alertcondition(sellEntrySignal, title="Short Alert", message="Vertex Pulse Strategy: Short Entry Detected")
