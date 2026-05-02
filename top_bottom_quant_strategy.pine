@@ -62,8 +62,8 @@ closeOnFlip   = input.bool(true, "Close on Opposite Signal", group=groupExec)
 tradeSizeUSD  = input.float(1000.0, "Order Size (USD)", minval=1, step=1, group=groupExec)
 usePercSL     = input.bool(false, "Use Percent Stop", group=groupExec)
 percSL        = input.float(1.0, "Percent Stop (%)", minval=0.1, step=0.1, group=groupExec)
-stopMultATR   = input.float(1.2, "ATR Stop (xATR)", minval=0.3, maxval=5.0, step=0.05, group=groupExec)
-tpMultATR     = input.float(2.4, "ATR Target (xATR)", minval=0.5, maxval=10.0, step=0.05, group=groupExec)
+stopMultATR   = input.float(1.0, "ATR Stop (xATR)", minval=0.3, maxval=5.0, step=0.05, group=groupExec)
+tpMultATR     = input.float(2.0, "ATR Target (xATR)", minval=0.5, maxval=10.0, step=0.05, group=groupExec)
 
 // ═══════════════════════════════════════════════════════════
 // GROUP 7 — RISK GUARD
@@ -80,6 +80,7 @@ enforceRiskOnSignals  = input.bool(true, "Enforce on Final Signals", group=group
 // GROUP 8 — DRAWDOWN CONTROL
 // ═══════════════════════════════════════════════════════════
 groupDD = "⑧ Drawdown Control"
+ddMode           = input.string("Off (Legacy)", "Control Mode", options=["Off (Legacy)", "Light", "Strict"], group=groupDD)
 useTrendFilter   = input.bool(true, "Trend Filter (EMA)", group=groupDD)
 trendEmaLen      = input.int(200, "Trend EMA Length", minval=20, maxval=500, group=groupDD)
 useAdxFilter     = input.bool(true, "ADX Filter", group=groupDD)
@@ -147,6 +148,18 @@ trendEma = ta.ema(close, trendEmaLen)
 [_, __, adxVal] = ta.dmi(adxLen, adxLen)
 atrBase = ta.sma(atrValueSig, atrRegimeLen)
 atrRatio = atrBase > 0 ? atrValueSig / atrBase : 1.0
+ddOff = ddMode == "Off (Legacy)"
+ddLight = ddMode == "Light"
+ddStrict = ddMode == "Strict"
+useTrendEff = useTrendFilter and not ddOff
+useAdxEff = useAdxFilter and not ddOff
+useAtrEff = useAtrRegime and not ddOff
+adxMinEff = ddLight ? adxMin * 0.8 : adxMin
+minAtrRatioEff = ddLight ? minAtrRatio * 0.9 : minAtrRatio
+maxAtrRatioEff = ddLight ? maxAtrRatio * 1.1 : maxAtrRatio
+breakEvenAtREff = ddLight ? breakEvenAtR * 1.2 : breakEvenAtR
+trailMultEff = ddLight ? trailMultATR * 1.15 : trailMultATR
+maxBarsInTradeEff = ddLight ? int(math.round(maxBarsInTrade * 1.25)) : maxBarsInTrade
 
 // ═══════════════════════════════════════════════════════════
 // SIGNAL GENERATION (CORE FROM ORIGINAL INDICATOR)
@@ -184,15 +197,17 @@ sellFilters          = rsiHotCond and (not requireVolSpike or volSurge_sig)
 buyBreakoutFilters   = rsiBullCond and (not requireVolSpike or volSurge_sig)
 sellBreakoutFilters  = rsiBearCond and (not requireVolSpike or volSurge_sig)
 
-longContextOK =
- (not useTrendFilter or close > trendEma) and
- (not useAdxFilter or adxVal >= adxMin) and
- (not useAtrRegime or (atrRatio >= minAtrRatio and atrRatio <= maxAtrRatio))
-
-shortContextOK =
- (not useTrendFilter or close < trendEma) and
- (not useAdxFilter or adxVal >= adxMin) and
- (not useAtrRegime or (atrRatio >= minAtrRatio and atrRatio <= maxAtrRatio))
+longTrendPass = not useTrendEff or close > trendEma
+shortTrendPass = not useTrendEff or close < trendEma
+adxPass = not useAdxEff or adxVal >= adxMinEff
+atrPass = not useAtrEff or (atrRatio >= minAtrRatioEff and atrRatio <= maxAtrRatioEff)
+activeFilterCount = (useTrendEff ? 1 : 0) + (useAdxEff ? 1 : 0) + (useAtrEff ? 1 : 0)
+longPassCount = (longTrendPass ? 1 : 0) + (adxPass ? 1 : 0) + (atrPass ? 1 : 0)
+shortPassCount = (shortTrendPass ? 1 : 0) + (adxPass ? 1 : 0) + (atrPass ? 1 : 0)
+requiredPassLight = int(math.max(1, activeFilterCount - 1))
+requiredPassStrict = activeFilterCount
+longContextOK = ddOff ? true : (ddLight ? longPassCount >= requiredPassLight : longPassCount >= requiredPassStrict)
+shortContextOK = ddOff ? true : (ddLight ? shortPassCount >= requiredPassLight : shortPassCount >= requiredPassStrict)
 
 // ═══════════════════════════════════════════════════════════
 // RISK GUARD STATE
@@ -304,14 +319,14 @@ if strategy.position_size > 0
     lowSinceEntry := na
     longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
     longStop = strategy.position_avg_price - longRisk
-    if enableBreakEven and close >= strategy.position_avg_price + longRisk * breakEvenAtR
+    if not ddOff and enableBreakEven and close >= strategy.position_avg_price + longRisk * breakEvenAtREff
         longStop := math.max(longStop, strategy.position_avg_price + breakEvenBufATR * atrValueSig)
-    if enableTrailStop
-        trailStopL = highSinceEntry - trailMultATR * atrValueSig
+    if not ddOff and enableTrailStop
+        trailStopL = highSinceEntry - trailMultEff * atrValueSig
         longStop := math.max(longStop, trailStopL)
     longTp   = strategy.position_avg_price + tpMultATR * atrValueSig
     strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTp, comment="L-TP/SL")
-    if enableTimeExit and not na(longEntryBar) and (bar_index - longEntryBar >= maxBarsInTrade)
+    if not ddOff and enableTimeExit and not na(longEntryBar) and (bar_index - longEntryBar >= maxBarsInTradeEff)
         strategy.close("Long", comment="L-TimeExit")
 
 if strategy.position_size < 0
@@ -320,14 +335,14 @@ if strategy.position_size < 0
     highSinceEntry := na
     shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * atrValueSig
     shortStop = strategy.position_avg_price + shortRisk
-    if enableBreakEven and close <= strategy.position_avg_price - shortRisk * breakEvenAtR
+    if not ddOff and enableBreakEven and close <= strategy.position_avg_price - shortRisk * breakEvenAtREff
         shortStop := math.min(shortStop, strategy.position_avg_price - breakEvenBufATR * atrValueSig)
-    if enableTrailStop
-        trailStopS = lowSinceEntry + trailMultATR * atrValueSig
+    if not ddOff and enableTrailStop
+        trailStopS = lowSinceEntry + trailMultEff * atrValueSig
         shortStop := math.min(shortStop, trailStopS)
     shortTp   = strategy.position_avg_price - tpMultATR * atrValueSig
     strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTp, comment="S-TP/SL")
-    if enableTimeExit and not na(shortEntryBar) and (bar_index - shortEntryBar >= maxBarsInTrade)
+    if not ddOff and enableTimeExit and not na(shortEntryBar) and (bar_index - shortEntryBar >= maxBarsInTradeEff)
         strategy.close("Short", comment="S-TimeExit")
 
 if strategy.position_size == 0
