@@ -99,6 +99,20 @@ enableTimeExit   = input.bool(true, "Max Holding Bars", group=groupDD)
 maxBarsInTrade   = input.int(60, "Exit After N Bars", minval=5, maxval=500, group=groupDD)
 
 // ═══════════════════════════════════════════════════════════
+// GROUP 9 — PROFIT ENGINE
+// ═══════════════════════════════════════════════════════════
+groupProfit = "⑨ Profit Engine"
+profitMode           = input.string("Balanced", "Profit Mode", options=["Off", "Balanced", "Trend-Only"], group=groupProfit)
+useRiskSizing        = input.bool(true, "Use Risk-based Position Size", group=groupProfit)
+riskPerTradePct      = input.float(0.5, "Risk per Trade (%)", minval=0.1, maxval=5.0, step=0.1, group=groupProfit)
+maxPositionUSD       = input.float(3000.0, "Max Position (USD)", minval=100, step=100, group=groupProfit)
+profitFastEmaLen     = input.int(55, "Fast EMA", minval=10, maxval=200, group=groupProfit)
+profitSlowEmaLen     = input.int(200, "Slow EMA", minval=20, maxval=500, group=groupProfit)
+profitAdxMin         = input.float(20.0, "Profit ADX Min", minval=5, maxval=60, step=0.5, group=groupProfit)
+profitTpFactor       = input.float(1.15, "TP Boost", minval=0.8, maxval=3.0, step=0.05, group=groupProfit)
+profitStopFactor     = input.float(0.95, "Stop Tighten", minval=0.5, maxval=1.5, step=0.05, group=groupProfit)
+
+// ═══════════════════════════════════════════════════════════
 // UTILITIES
 // ═══════════════════════════════════════════════════════════
 clamp(v, lo, hi) =>
@@ -148,9 +162,13 @@ trendEma = ta.ema(close, trendEmaLen)
 [_, __, adxVal] = ta.dmi(adxLen, adxLen)
 atrBase = ta.sma(atrValueSig, atrRegimeLen)
 atrRatio = atrBase > 0 ? atrValueSig / atrBase : 1.0
+profitFastEma = ta.ema(close, profitFastEmaLen)
+profitSlowEma = ta.ema(close, profitSlowEmaLen)
 ddOff = ddMode == "Off (Legacy)"
 ddLight = ddMode == "Light"
 ddStrict = ddMode == "Strict"
+profitOff = profitMode == "Off"
+profitTrendOnly = profitMode == "Trend-Only"
 useTrendEff = useTrendFilter and not ddOff
 useAdxEff = useAdxFilter and not ddOff
 useAtrEff = useAtrRegime and not ddOff
@@ -208,6 +226,10 @@ requiredPassLight = int(math.max(1, activeFilterCount - 1))
 requiredPassStrict = activeFilterCount
 longContextOK = ddOff ? true : (ddLight ? longPassCount >= requiredPassLight : longPassCount >= requiredPassStrict)
 shortContextOK = ddOff ? true : (ddLight ? shortPassCount >= requiredPassLight : shortPassCount >= requiredPassStrict)
+profitLongBias = profitOff ? true : (profitFastEma > profitSlowEma and adxVal >= profitAdxMin)
+profitShortBias = profitOff ? true : (profitFastEma < profitSlowEma and adxVal >= profitAdxMin)
+profitGateLong = profitOff ? true : (profitTrendOnly ? profitLongBias : (profitLongBias or (close > profitSlowEma and adxVal >= profitAdxMin * 0.8)))
+profitGateShort = profitOff ? true : (profitTrendOnly ? profitShortBias : (profitShortBias or (close < profitSlowEma and adxVal >= profitAdxMin * 0.8)))
 
 // ═══════════════════════════════════════════════════════════
 // RISK GUARD STATE
@@ -296,7 +318,12 @@ if barstate.isconfirmed and (buySignal or sellSignal)
 // ═══════════════════════════════════════════════════════════
 // STRATEGY ORDERS
 // ═══════════════════════════════════════════════════════════
-qty = close > 0 ? tradeSizeUSD / close : 0.0
+baseQty = close > 0 ? tradeSizeUSD / close : 0.0
+stopDistNow = usePercSL ? close * (percSL / 100.0) : stopMultATR * atrValueSig
+riskCapital = strategy.equity * (riskPerTradePct / 100.0)
+riskQtyRaw = stopDistNow > 0 ? riskCapital / stopDistNow : 0.0
+maxQty = close > 0 ? maxPositionUSD / close : 0.0
+qty = useRiskSizing ? math.min(math.min(riskQtyRaw, maxQty), baseQty) : math.min(baseQty, maxQty)
 
 var int longEntryBar = na
 var int shortEntryBar = na
@@ -305,8 +332,8 @@ var float lowSinceEntry = na
 var float longEntryATR = na
 var float shortEntryATR = na
 
-buyEntrySignal = buySignal and longContextOK
-sellEntrySignal = sellSignal and shortContextOK
+buyEntrySignal = buySignal and longContextOK and profitGateLong
+sellEntrySignal = sellSignal and shortContextOK and profitGateShort
 
 if buyEntrySignal and allowLong and qty > 0
     if closeOnFlip and strategy.position_size < 0
@@ -323,14 +350,16 @@ if strategy.position_size > 0
     highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
     lowSinceEntry := na
     longEntryATR := na(longEntryATR) ? atrValueSig : longEntryATR
-    longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * longEntryATR
+    stopMultEff = profitOff ? stopMultATR : stopMultATR * profitStopFactor
+    tpMultEff = profitOff ? tpMultATR : tpMultATR * profitTpFactor
+    longRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultEff * longEntryATR
     longStop = strategy.position_avg_price - longRisk
     if not ddOff and enableBreakEven and close >= strategy.position_avg_price + longRisk * breakEvenAtREff
         longStop := math.max(longStop, strategy.position_avg_price + breakEvenBufATR * atrValueSig)
     if not ddOff and enableTrailStop
         trailStopL = highSinceEntry - trailMultEff * atrValueSig
         longStop := math.max(longStop, trailStopL)
-    longTp   = strategy.position_avg_price + tpMultATR * longEntryATR
+    longTp   = strategy.position_avg_price + tpMultEff * longEntryATR
     strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTp, comment="L-TP/SL")
     if not ddOff and enableTimeExit and not na(longEntryBar) and (bar_index - longEntryBar >= maxBarsInTradeEff)
         strategy.close("Long", comment="L-TimeExit")
@@ -340,14 +369,16 @@ if strategy.position_size < 0
     lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
     highSinceEntry := na
     shortEntryATR := na(shortEntryATR) ? atrValueSig : shortEntryATR
-    shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultATR * shortEntryATR
+    stopMultEff = profitOff ? stopMultATR : stopMultATR * profitStopFactor
+    tpMultEff = profitOff ? tpMultATR : tpMultATR * profitTpFactor
+    shortRisk = usePercSL ? strategy.position_avg_price * (percSL / 100.0) : stopMultEff * shortEntryATR
     shortStop = strategy.position_avg_price + shortRisk
     if not ddOff and enableBreakEven and close <= strategy.position_avg_price - shortRisk * breakEvenAtREff
         shortStop := math.min(shortStop, strategy.position_avg_price - breakEvenBufATR * atrValueSig)
     if not ddOff and enableTrailStop
         trailStopS = lowSinceEntry + trailMultEff * atrValueSig
         shortStop := math.min(shortStop, trailStopS)
-    shortTp   = strategy.position_avg_price - tpMultATR * shortEntryATR
+    shortTp   = strategy.position_avg_price - tpMultEff * shortEntryATR
     strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTp, comment="S-TP/SL")
     if not ddOff and enableTimeExit and not na(shortEntryBar) and (bar_index - shortEntryBar >= maxBarsInTradeEff)
         strategy.close("Short", comment="S-TimeExit")
@@ -369,6 +400,8 @@ plot(rTrendSig == -1 ? rDnSig : na, "Bear Band", color=color.new(color.red, 20))
 plotshape(buyEntrySignal, title="Long Entry", location=location.belowbar, style=shape.labelup, text="Buy ▲", size=size.small, color=color.new(color.teal, 0), textcolor=color.white)
 plotshape(sellEntrySignal, title="Short Entry", location=location.abovebar, style=shape.labeldown, text="Sell ▼", size=size.small, color=color.new(color.red, 0), textcolor=color.white)
 plot(useTrendFilter ? trendEma : na, "Trend EMA", color=color.new(color.yellow, 0))
+plot(not profitOff ? profitFastEma : na, "Profit Fast EMA", color=color.new(color.aqua, 0))
+plot(not profitOff ? profitSlowEma : na, "Profit Slow EMA", color=color.new(color.orange, 0))
 
 alertcondition(buyEntrySignal, title="Long Alert", message="Vertex Pulse Strategy: Long Entry Detected")
 alertcondition(sellEntrySignal, title="Short Alert", message="Vertex Pulse Strategy: Short Entry Detected")
