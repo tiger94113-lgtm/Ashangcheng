@@ -1,0 +1,230 @@
+//@version=6
+strategy("VEGAS隧道三K确认策略 + 相对低点止损", overlay=true, pyramiding=3, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.05, process_orders_on_close=true)
+
+// === 参数：均线与通道 ===
+groupTrend = "① 趋势与通道"
+emaFastLen  = input.int(21,  "EMA 快线", group=groupTrend)
+emaMid1Len  = input.int(99,  "EMA 中线1", group=groupTrend)
+emaMid2Len  = input.int(144, "EMA 中线2", group=groupTrend)
+emaMid3Len  = input.int(169, "EMA 中线3", group=groupTrend)
+emaChannel1Len = input.int(576, "EMA 通道1 下轨", group=groupTrend)
+emaChannel2Len = input.int(676, "EMA 通道1 上轨", group=groupTrend)
+
+// === 参数：Vegas 通道 ===
+groupVegas = "② Vegas 通道"
+useVegasChannel    = input.bool(true,  "启用 Vegas 通道", group=groupVegas)
+atrLen             = input.int(14,     "ATR 周期", group=groupVegas)
+rangeMultiplier    = input.float(1.5,  "Vegas 宽度倍数", step=0.1, group=groupVegas)
+useVegasBiasFilter = input.bool(true,  "启用 Vegas 方向过滤", group=groupVegas)
+strictVegasBreak   = input.bool(false, "严格突破才开仓", group=groupVegas, tooltip="开=多头需收盘站上Vegas上轨，空头需收盘跌破Vegas下轨")
+
+// === 参数：交易执行 ===
+groupExec = "③ 执行与加仓"
+baseOrderUSD = input.float(1000, "首仓金额(USD)", minval=1, step=1, group=groupExec)
+addOrderUSD  = input.float(500,  "加仓金额(USD)", minval=1, step=1, group=groupExec)
+enableAdd    = input.bool(true,  "允许加仓", group=groupExec)
+maxAdds      = input.int(2,      "最多加仓次数", minval=0, maxval=10, group=groupExec)
+closeOnFlip  = input.bool(true,  "反向信号平仓反手", group=groupExec)
+
+// === 参数：风控（相对低点止损） ===
+groupRisk = "④ 风险控制"
+relStopLookback = input.int(10, "相对低/高点回看K数", minval=2, maxval=200, group=groupRisk)
+stopBufferATR   = input.float(0.2, "止损缓冲(ATR)", minval=0.0, maxval=5.0, step=0.05, group=groupRisk)
+useTakeProfit   = input.bool(true, "启用止盈", group=groupRisk)
+tpRR            = input.float(2.0, "止盈RR倍数", minval=0.5, maxval=10.0, step=0.1, group=groupRisk)
+
+// === 参数：入场过滤 ===
+groupFilter = "⑤ 入场过滤"
+filterMode          = input.string("标准", "过滤强度", options=["宽松", "标准", "严格"], group=groupFilter, tooltip="宽松=放行更多信号；标准=平衡；严格=质量优先")
+useTrendOrderFilter = input.bool(true, "趋势序列过滤", group=groupFilter, tooltip="多头需EMA99>EMA144>EMA169且均线向上；空头反之")
+useCandleFilter     = input.bool(true, "K线方向过滤", group=groupFilter, tooltip="多头需阳线，空头需阴线")
+useVolumeFilter     = input.bool(false, "成交量过滤", group=groupFilter)
+volumeLen           = input.int(20, "成交量均线周期", minval=2, maxval=200, group=groupFilter)
+volumeMultiplier    = input.float(1.1, "成交量阈值倍数", minval=0.5, maxval=5.0, step=0.1, group=groupFilter)
+useDistanceFilter   = input.bool(true, "远离中轴过滤", group=groupFilter, tooltip="价格距离Vegas中轴过远时不追单")
+maxDistanceATR      = input.float(2.5, "最大偏离(ATR)", minval=0.5, maxval=10.0, step=0.1, group=groupFilter)
+entryCooldownBars   = input.int(3, "入场冷却K数", minval=0, maxval=100, group=groupFilter)
+
+// === 均线计算 ===
+emaFast = ta.ema(close, emaFastLen)
+emaMid1 = ta.ema(close, emaMid1Len)
+emaMid2 = ta.ema(close, emaMid2Len)
+emaMid3 = ta.ema(close, emaMid3Len)
+emaChLow  = ta.ema(close, emaChannel1Len)
+emaChHigh = ta.ema(close, emaChannel2Len)
+
+// === 趋势确认：连续三根K线 ===
+emaFastAboveAll = emaFast > emaMid1 and emaFast > emaMid2 and emaFast > emaMid3
+emaFastBelowAll = emaFast < emaMid1 and emaFast < emaMid2 and emaFast < emaMid3
+bullConfirmed = emaFastAboveAll and emaFastAboveAll[1] and emaFastAboveAll[2]
+bearConfirmed = emaFastBelowAll and emaFastBelowAll[1] and emaFastBelowAll[2]
+rawBullSignal = bullConfirmed and not bullConfirmed[1]
+rawBearSignal = bearConfirmed and not bearConfirmed[1]
+
+// === 趋势状态 ===
+var bool inBull = false
+var bool inBear = false
+var bool hasBullSignal = false
+var bool hasBearSignal = false
+
+bullSignal = false
+bearSignal = false
+
+if rawBullSignal
+    if not inBull
+        bullSignal := true
+        hasBullSignal := true
+    inBull := true
+    inBear := false
+    hasBearSignal := false
+
+if rawBearSignal
+    if not inBear
+        bearSignal := true
+        hasBearSignal := true
+    inBear := true
+    inBull := false
+    hasBullSignal := false
+
+// === 加仓信号 ===
+bullTouched = low <= emaMid1 or low <= emaMid2 or low <= emaMid3
+bullCloseAboveAll = close > emaMid1 and close > emaMid2 and close > emaMid3
+bullAddSignal = inBull and hasBullSignal and bullTouched and bullCloseAboveAll and not bullSignal
+
+bearTouched = high >= emaMid1 or high >= emaMid2 or high >= emaMid3
+bearCloseBelowAll = close < emaMid1 and close < emaMid2 and close < emaMid3
+bearAddSignal = inBear and hasBearSignal and bearTouched and bearCloseBelowAll and not bearSignal
+
+// === Vegas 通道 ===
+midRange = (emaMid1 + emaMid2 + emaMid3) / 3.0
+atr = ta.atr(atrLen)
+vegasUpper = midRange + atr * rangeMultiplier
+vegasLower = midRange - atr * rangeMultiplier
+
+longVegasOK = not useVegasChannel or not useVegasBiasFilter or (strictVegasBreak ? close > vegasUpper : close > midRange)
+shortVegasOK = not useVegasChannel or not useVegasBiasFilter or (strictVegasBreak ? close < vegasLower : close < midRange)
+
+// === 无效入场过滤 ===
+volMA = ta.sma(volume, volumeLen)
+volPass = not useVolumeFilter or na(volMA) or volMA <= 0 or volume >= volMA * volumeMultiplier
+distMaxEff = filterMode == "宽松" ? maxDistanceATR * 1.5 : filterMode == "严格" ? maxDistanceATR * 0.8 : maxDistanceATR
+distancePass = not useDistanceFilter or math.abs(close - midRange) <= atr * distMaxEff
+
+trendOrderLong = emaMid1 > emaMid2 and emaMid2 > emaMid3 and emaMid1 > emaMid1[1] and emaMid2 > emaMid2[1] and emaMid3 > emaMid3[1]
+trendOrderShort = emaMid1 < emaMid2 and emaMid2 < emaMid3 and emaMid1 < emaMid1[1] and emaMid2 < emaMid2[1] and emaMid3 < emaMid3[1]
+trendPassLong = not useTrendOrderFilter or trendOrderLong
+trendPassShort = not useTrendOrderFilter or trendOrderShort
+
+candlePassLong = not useCandleFilter or close > open
+candlePassShort = not useCandleFilter or close < open
+
+var int lastEntryBar = na
+cooldownEff = filterMode == "宽松" ? math.max(0, entryCooldownBars - 1) : filterMode == "严格" ? entryCooldownBars + 1 : entryCooldownBars
+cooldownPass = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownEff
+
+longPassCount = (useTrendOrderFilter and trendPassLong ? 1 : 0) + (useCandleFilter and candlePassLong ? 1 : 0) + (useVolumeFilter and volPass ? 1 : 0) + (useDistanceFilter and distancePass ? 1 : 0)
+shortPassCount = (useTrendOrderFilter and trendPassShort ? 1 : 0) + (useCandleFilter and candlePassShort ? 1 : 0) + (useVolumeFilter and volPass ? 1 : 0) + (useDistanceFilter and distancePass ? 1 : 0)
+enabledFilterCount = (useTrendOrderFilter ? 1 : 0) + (useCandleFilter ? 1 : 0) + (useVolumeFilter ? 1 : 0) + (useDistanceFilter ? 1 : 0)
+
+requiredMain = filterMode == "宽松" ? math.max(0, enabledFilterCount - 2) : filterMode == "严格" ? enabledFilterCount : math.max(0, enabledFilterCount - 1)
+requiredAdd  = filterMode == "宽松" ? math.max(0, enabledFilterCount - 3) : filterMode == "严格" ? math.max(1, enabledFilterCount - 1) : math.max(0, enabledFilterCount - 2)
+
+entryFilterLongMain = longPassCount >= requiredMain and cooldownPass
+entryFilterShortMain = shortPassCount >= requiredMain and cooldownPass
+entryFilterLongAdd = longPassCount >= requiredAdd and cooldownPass
+entryFilterShortAdd = shortPassCount >= requiredAdd and cooldownPass
+
+// === 入场与止损状态 ===
+var int addCount = 0
+var float longStop = na
+var float shortStop = na
+
+longRelLow = ta.lowest(low, relStopLookback)
+shortRelHigh = ta.highest(high, relStopLookback)
+longStopCandidate = longRelLow - stopBufferATR * atr
+shortStopCandidate = shortRelHigh + stopBufferATR * atr
+
+baseQty = close > 0 ? baseOrderUSD / close : 0.0
+addQty  = close > 0 ? addOrderUSD / close : 0.0
+
+longEntry = bullSignal and longVegasOK and entryFilterLongMain
+shortEntry = bearSignal and shortVegasOK and entryFilterShortMain
+longAdd = enableAdd and bullAddSignal and longVegasOK and entryFilterLongAdd and strategy.position_size > 0 and addCount < maxAdds
+shortAdd = enableAdd and bearAddSignal and shortVegasOK and entryFilterShortAdd and strategy.position_size < 0 and addCount < maxAdds
+
+// === 开仓与反手 ===
+if longEntry
+    if closeOnFlip and strategy.position_size < 0
+        strategy.close("Short", comment="Flip -> Long")
+    strategy.entry("Long", strategy.long, qty=baseQty, comment="Long Start")
+    longStop := na(longStop) ? longStopCandidate : math.max(longStop, longStopCandidate)
+    addCount := 0
+    lastEntryBar := bar_index
+
+if shortEntry
+    if closeOnFlip and strategy.position_size > 0
+        strategy.close("Long", comment="Flip -> Short")
+    strategy.entry("Short", strategy.short, qty=baseQty, comment="Short Start")
+    shortStop := na(shortStop) ? shortStopCandidate : math.min(shortStop, shortStopCandidate)
+    addCount := 0
+    lastEntryBar := bar_index
+
+if longAdd
+    strategy.entry("Long", strategy.long, qty=addQty, comment="Long Add")
+    longStop := na(longStop) ? longStopCandidate : math.max(longStop, longStopCandidate)
+    addCount += 1
+    lastEntryBar := bar_index
+
+if shortAdd
+    strategy.entry("Short", strategy.short, qty=addQty, comment="Short Add")
+    shortStop := na(shortStop) ? shortStopCandidate : math.min(shortStop, shortStopCandidate)
+    addCount += 1
+    lastEntryBar := bar_index
+
+// === 持仓管理：相对低点/高点止损 + RR止盈 ===
+if strategy.position_size > 0
+    longStop := na(longStop) ? longStopCandidate : math.max(longStop, longStopCandidate)
+    longRisk = math.max(strategy.position_avg_price - longStop, syminfo.mintick)
+    longTp = strategy.position_avg_price + longRisk * tpRR
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=useTakeProfit ? longTp : na, comment="L SL/TP")
+
+if strategy.position_size < 0
+    shortStop := na(shortStop) ? shortStopCandidate : math.min(shortStop, shortStopCandidate)
+    shortRisk = math.max(shortStop - strategy.position_avg_price, syminfo.mintick)
+    shortTp = strategy.position_avg_price - shortRisk * tpRR
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=useTakeProfit ? shortTp : na, comment="S SL/TP")
+
+if strategy.position_size == 0
+    addCount := 0
+    longStop := na
+    shortStop := na
+
+// === 可视化 ===
+bgcolor(inBull ? color.new(#4CAF50, 90) : inBear ? color.new(#F44336, 90) : na)
+
+plot(emaFast, title="EMA 快线", color=color.orange)
+plot(emaMid1, title="EMA 中线1", color=color.blue)
+plot(emaMid2, title="EMA 中线2", color=color.green)
+plot(emaMid3, title="EMA 中线3", color=color.red)
+plot(emaChLow, title="通道1下轨 EMA576", color=color.new(color.gray, 50))
+plot(emaChHigh, title="通道1上轨 EMA676", color=color.new(color.gray, 50))
+
+plotVegasUpper = plot(useVegasChannel ? vegasUpper : na, title="Vegas通道上轨", color=color.new(#9C27B0, 60))
+plotVegasLower = plot(useVegasChannel ? vegasLower : na, title="Vegas通道下轨", color=color.new(#9C27B0, 60))
+fill(plotVegasUpper, plotVegasLower, color=color.new(#BA68C8, 85), title="Vegas通道填充")
+
+fill(plot(emaMid2, display=display.none), plot(emaMid3, display=display.none), color=color.new(color.red, 85), title="中线通道填充")
+fill(plot(emaChLow, display=display.none), plot(emaChHigh, display=display.none), color=color.new(color.gray, 90), title="远期通道填充")
+
+plot(strategy.position_size > 0 ? longStop : na, title="多头相对低点止损", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortStop : na, title="空头相对高点止损", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(longEntry, title="多头启动", location=location.belowbar, style=shape.labelup, text="多头", size=size.small, color=color.green, textcolor=color.white)
+plotshape(shortEntry, title="空头启动", location=location.abovebar, style=shape.labeldown, text="空头", size=size.small, color=color.red, textcolor=color.white)
+plotshape(longAdd, title="Buy 加仓", location=location.belowbar, style=shape.circle, color=color.green, size=size.tiny)
+plotshape(shortAdd, title="Sell 加仓", location=location.abovebar, style=shape.circle, color=color.red, size=size.tiny)
+
+alertcondition(longEntry, title="多头启动提醒", message="Vegas策略：多头启动")
+alertcondition(shortEntry, title="空头启动提醒", message="Vegas策略：空头启动")
+alertcondition(longAdd, title="多头加仓提醒", message="Vegas策略：多头加仓")
+alertcondition(shortAdd, title="空头加仓提醒", message="Vegas策略：空头加仓")
