@@ -35,6 +35,7 @@ tpRR            = input.float(2.0, "止盈RR倍数", minval=0.5, maxval=10.0, st
 
 // === 参数：入场过滤 ===
 groupFilter = "⑤ 入场过滤"
+filterMode          = input.string("标准", "过滤强度", options=["宽松", "标准", "严格"], group=groupFilter, tooltip="宽松=放行更多信号；标准=平衡；严格=质量优先")
 useTrendOrderFilter = input.bool(true, "趋势序列过滤", group=groupFilter, tooltip="多头需EMA99>EMA144>EMA169且均线向上；空头反之")
 useCandleFilter     = input.bool(true, "K线方向过滤", group=groupFilter, tooltip="多头需阳线，空头需阴线")
 useVolumeFilter     = input.bool(false, "成交量过滤", group=groupFilter)
@@ -106,7 +107,8 @@ shortVegasOK = not useVegasChannel or not useVegasBiasFilter or (strictVegasBrea
 // === 无效入场过滤 ===
 volMA = ta.sma(volume, volumeLen)
 volPass = not useVolumeFilter or na(volMA) or volMA <= 0 or volume >= volMA * volumeMultiplier
-distancePass = not useDistanceFilter or math.abs(close - midRange) <= atr * maxDistanceATR
+distMaxEff = filterMode == "宽松" ? maxDistanceATR * 1.5 : filterMode == "严格" ? maxDistanceATR * 0.8 : maxDistanceATR
+distancePass = not useDistanceFilter or math.abs(close - midRange) <= atr * distMaxEff
 
 trendOrderLong = emaMid1 > emaMid2 and emaMid2 > emaMid3 and emaMid1 > emaMid1[1] and emaMid2 > emaMid2[1] and emaMid3 > emaMid3[1]
 trendOrderShort = emaMid1 < emaMid2 and emaMid2 < emaMid3 and emaMid1 < emaMid1[1] and emaMid2 < emaMid2[1] and emaMid3 < emaMid3[1]
@@ -117,10 +119,20 @@ candlePassLong = not useCandleFilter or close > open
 candlePassShort = not useCandleFilter or close < open
 
 var int lastEntryBar = na
-cooldownPass = na(lastEntryBar) or bar_index - lastEntryBar >= entryCooldownBars
+cooldownEff = filterMode == "宽松" ? math.max(0, entryCooldownBars - 1) : filterMode == "严格" ? entryCooldownBars + 1 : entryCooldownBars
+cooldownPass = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownEff
 
-entryFilterLong = trendPassLong and candlePassLong and volPass and distancePass and cooldownPass
-entryFilterShort = trendPassShort and candlePassShort and volPass and distancePass and cooldownPass
+longPassCount = (useTrendOrderFilter and trendPassLong ? 1 : 0) + (useCandleFilter and candlePassLong ? 1 : 0) + (useVolumeFilter and volPass ? 1 : 0) + (useDistanceFilter and distancePass ? 1 : 0)
+shortPassCount = (useTrendOrderFilter and trendPassShort ? 1 : 0) + (useCandleFilter and candlePassShort ? 1 : 0) + (useVolumeFilter and volPass ? 1 : 0) + (useDistanceFilter and distancePass ? 1 : 0)
+enabledFilterCount = (useTrendOrderFilter ? 1 : 0) + (useCandleFilter ? 1 : 0) + (useVolumeFilter ? 1 : 0) + (useDistanceFilter ? 1 : 0)
+
+requiredMain = filterMode == "宽松" ? math.max(0, enabledFilterCount - 2) : filterMode == "严格" ? enabledFilterCount : math.max(0, enabledFilterCount - 1)
+requiredAdd  = filterMode == "宽松" ? math.max(0, enabledFilterCount - 3) : filterMode == "严格" ? math.max(1, enabledFilterCount - 1) : math.max(0, enabledFilterCount - 2)
+
+entryFilterLongMain = longPassCount >= requiredMain and cooldownPass
+entryFilterShortMain = shortPassCount >= requiredMain and cooldownPass
+entryFilterLongAdd = longPassCount >= requiredAdd and cooldownPass
+entryFilterShortAdd = shortPassCount >= requiredAdd and cooldownPass
 
 // === 入场与止损状态 ===
 var int addCount = 0
@@ -135,10 +147,10 @@ shortStopCandidate = shortRelHigh + stopBufferATR * atr
 baseQty = close > 0 ? baseOrderUSD / close : 0.0
 addQty  = close > 0 ? addOrderUSD / close : 0.0
 
-longEntry = bullSignal and longVegasOK and entryFilterLong
-shortEntry = bearSignal and shortVegasOK and entryFilterShort
-longAdd = enableAdd and bullAddSignal and longVegasOK and entryFilterLong and strategy.position_size > 0 and addCount < maxAdds
-shortAdd = enableAdd and bearAddSignal and shortVegasOK and entryFilterShort and strategy.position_size < 0 and addCount < maxAdds
+longEntry = bullSignal and longVegasOK and entryFilterLongMain
+shortEntry = bearSignal and shortVegasOK and entryFilterShortMain
+longAdd = enableAdd and bullAddSignal and longVegasOK and entryFilterLongAdd and strategy.position_size > 0 and addCount < maxAdds
+shortAdd = enableAdd and bearAddSignal and shortVegasOK and entryFilterShortAdd and strategy.position_size < 0 and addCount < maxAdds
 
 // === 开仓与反手 ===
 if longEntry
