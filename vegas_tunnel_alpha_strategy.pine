@@ -33,8 +33,19 @@ rsiLongMin = input.int(52, "多头最小 RSI", minval=1, maxval=99, group=groupE
 rsiShortMax = input.int(48, "空头最大 RSI", minval=1, maxval=99, group=groupEntry)
 entryCooldownBars = input.int(2, "入场冷却K数", minval=0, maxval=100, group=groupEntry)
 
-// === ④ 仓位与加仓 ===
-groupPos = "④ Position"
+// === ④ 结构顶底引擎 ===
+groupStruct = "④ Structure Engine"
+entryMode = input.string("混合模式", "信号模式", options=["趋势模式", "结构模式", "混合模式"], group=groupStruct)
+pivotLeft = input.int(3, "Pivot 左侧K数", minval=1, maxval=20, group=groupStruct)
+pivotRight = input.int(3, "Pivot 右侧K数", minval=1, maxval=20, group=groupStruct)
+structureValidBars = input.int(12, "扫流动性有效窗口", minval=1, maxval=100, group=groupStruct)
+requireSweepConfirm = input.bool(true, "要求先扫流动性再CHOCH", group=groupStruct)
+structureRsiLong = input.int(50, "结构多头最小RSI", minval=1, maxval=99, group=groupStruct)
+structureRsiShort = input.int(50, "结构空头最大RSI", minval=1, maxval=99, group=groupStruct)
+useStructureSlopeBias = input.bool(true, "结构信号要求斜率同向", group=groupStruct)
+
+// === ⑤ 仓位与加仓 ===
+groupPos = "⑤ Position"
 riskPct = input.float(0.5, "单笔风险(%)", minval=0.1, maxval=5.0, step=0.1, group=groupPos)
 maxPosUSD = input.float(3000, "最大仓位金额(USD)", minval=100, step=100, group=groupPos)
 minRiskAtrMult = input.float(0.35, "最小风险距离(ATR)", minval=0.1, maxval=3.0, step=0.05, group=groupPos)
@@ -46,8 +57,8 @@ addQtyFactor = input.float(0.5, "加仓仓位系数", minval=0.1, maxval=2.0, st
 addOnlyInProfit = input.bool(true, "仅盈利时加仓", group=groupPos)
 closeOnFlip = input.bool(true, "反向信号反手", group=groupPos)
 
-// === ⑤ 相对低点止损 + 分批止盈 ===
-groupRisk = "⑤ Risk & Exit"
+// === ⑥ 相对低点止损 + 分批止盈 ===
+groupRisk = "⑥ Risk & Exit"
 swingLookback = input.int(6, "相对低/高点回看", minval=2, maxval=200, group=groupRisk)
 stopBufferATR = input.float(0.05, "止损缓冲(ATR)", minval=0.0, maxval=3.0, step=0.05, group=groupRisk)
 maxHoldBars = input.int(168, "最大持仓K数", minval=12, maxval=5000, group=groupRisk)
@@ -104,8 +115,45 @@ pullbackShort = usePullbackEntry and regimeBear and pullbackZoneShort and moment
 breakoutLong = useBreakoutEntry and regimeBull and close > ta.highest(high, breakoutLookback)[1] and notOverExtended and rsi >= rsiLongMin
 breakoutShort = useBreakoutEntry and regimeBear and close < ta.lowest(low, breakoutLookback)[1] and notOverExtended and rsi <= rsiShortMax
 
-rawLongSignal = pullbackLong or breakoutLong
-rawShortSignal = pullbackShort or breakoutShort
+trendLongSignal = pullbackLong or breakoutLong
+trendShortSignal = pullbackShort or breakoutShort
+
+// === 结构顶底检测：Pivot + 扫流动性 + CHOCH ===
+pivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+pivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var int lastSweepLowBar = na
+var int lastSweepHighBar = na
+
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+
+sweepLow = not na(lastPivotLow) and low < lastPivotLow and close > lastPivotLow
+sweepHigh = not na(lastPivotHigh) and high > lastPivotHigh and close < lastPivotHigh
+
+if sweepLow
+    lastSweepLowBar := bar_index
+if sweepHigh
+    lastSweepHighBar := bar_index
+
+longSweepReady = not requireSweepConfirm or (not na(lastSweepLowBar) and bar_index - lastSweepLowBar <= structureValidBars)
+shortSweepReady = not requireSweepConfirm or (not na(lastSweepHighBar) and bar_index - lastSweepHighBar <= structureValidBars)
+
+chochBull = not na(lastPivotHigh) and close > lastPivotHigh
+chochBear = not na(lastPivotLow) and close < lastPivotLow
+
+structSlopeLongOK = not useStructureSlopeBias or tunnelSlope >= 0
+structSlopeShortOK = not useStructureSlopeBias or tunnelSlope <= 0
+
+structLongSignal = chochBull and longSweepReady and rsi >= structureRsiLong and structSlopeLongOK
+structShortSignal = chochBear and shortSweepReady and rsi <= structureRsiShort and structSlopeShortOK
+
+modeLongSignal = entryMode == "趋势模式" ? trendLongSignal : entryMode == "结构模式" ? structLongSignal : (trendLongSignal or structLongSignal)
+modeShortSignal = entryMode == "趋势模式" ? trendShortSignal : entryMode == "结构模式" ? structShortSignal : (trendShortSignal or structShortSignal)
 
 // === 冷却控制 ===
 var int lastEntryBar = na
@@ -137,8 +185,8 @@ var bool longTp1Hit = false
 var bool shortTp1Hit = false
 var int barsInTrade = 0
 
-longEntry = allowLong and rawLongSignal and cooldownPass and strategy.position_size <= 0
-shortEntry = allowShort and rawShortSignal and cooldownPass and strategy.position_size >= 0
+longEntry = allowLong and modeLongSignal and cooldownPass and strategy.position_size <= 0
+shortEntry = allowShort and modeShortSignal and cooldownPass and strategy.position_size >= 0
 
 longAdd = enableAdd and strategy.position_size > 0 and addCount < maxAdds and cooldownPass and pullbackLong and (not addOnlyInProfit or close > strategy.position_avg_price)
 shortAdd = enableAdd and strategy.position_size < 0 and addCount < maxAdds and cooldownPass and pullbackShort and (not addOnlyInProfit or close < strategy.position_avg_price)
@@ -250,6 +298,8 @@ bgcolor(regimeBull ? color.new(color.green, 92) : regimeBear ? color.new(color.r
 
 plotshape(longEntry, title="Long Entry", style=shape.labelup, location=location.belowbar, color=color.green, text="Long", textcolor=color.white, size=size.small)
 plotshape(shortEntry, title="Short Entry", style=shape.labeldown, location=location.abovebar, color=color.red, text="Short", textcolor=color.white, size=size.small)
+plotshape(structLongSignal, title="Struct Long", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny)
+plotshape(structShortSignal, title="Struct Short", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny)
 plotshape(longAdd, title="Long Add", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
 plotshape(shortAdd, title="Short Add", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
 
