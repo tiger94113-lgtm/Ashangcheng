@@ -33,6 +33,17 @@ stopBufferATR   = input.float(0.2, "止损缓冲(ATR)", minval=0.0, maxval=5.0, 
 useTakeProfit   = input.bool(true, "启用止盈", group=groupRisk)
 tpRR            = input.float(2.0, "止盈RR倍数", minval=0.5, maxval=10.0, step=0.1, group=groupRisk)
 
+// === 参数：入场过滤 ===
+groupFilter = "⑤ 入场过滤"
+useTrendOrderFilter = input.bool(true, "趋势序列过滤", group=groupFilter, tooltip="多头需EMA99>EMA144>EMA169且均线向上；空头反之")
+useCandleFilter     = input.bool(true, "K线方向过滤", group=groupFilter, tooltip="多头需阳线，空头需阴线")
+useVolumeFilter     = input.bool(false, "成交量过滤", group=groupFilter)
+volumeLen           = input.int(20, "成交量均线周期", minval=2, maxval=200, group=groupFilter)
+volumeMultiplier    = input.float(1.1, "成交量阈值倍数", minval=0.5, maxval=5.0, step=0.1, group=groupFilter)
+useDistanceFilter   = input.bool(true, "远离中轴过滤", group=groupFilter, tooltip="价格距离Vegas中轴过远时不追单")
+maxDistanceATR      = input.float(2.5, "最大偏离(ATR)", minval=0.5, maxval=10.0, step=0.1, group=groupFilter)
+entryCooldownBars   = input.int(3, "入场冷却K数", minval=0, maxval=100, group=groupFilter)
+
 // === 均线计算 ===
 emaFast = ta.ema(close, emaFastLen)
 emaMid1 = ta.ema(close, emaMid1Len)
@@ -92,6 +103,25 @@ vegasLower = midRange - atr * rangeMultiplier
 longVegasOK = not useVegasChannel or not useVegasBiasFilter or (strictVegasBreak ? close > vegasUpper : close > midRange)
 shortVegasOK = not useVegasChannel or not useVegasBiasFilter or (strictVegasBreak ? close < vegasLower : close < midRange)
 
+// === 无效入场过滤 ===
+volMA = ta.sma(volume, volumeLen)
+volPass = not useVolumeFilter or na(volMA) or volMA <= 0 or volume >= volMA * volumeMultiplier
+distancePass = not useDistanceFilter or math.abs(close - midRange) <= atr * maxDistanceATR
+
+trendOrderLong = emaMid1 > emaMid2 and emaMid2 > emaMid3 and emaMid1 > emaMid1[1] and emaMid2 > emaMid2[1] and emaMid3 > emaMid3[1]
+trendOrderShort = emaMid1 < emaMid2 and emaMid2 < emaMid3 and emaMid1 < emaMid1[1] and emaMid2 < emaMid2[1] and emaMid3 < emaMid3[1]
+trendPassLong = not useTrendOrderFilter or trendOrderLong
+trendPassShort = not useTrendOrderFilter or trendOrderShort
+
+candlePassLong = not useCandleFilter or close > open
+candlePassShort = not useCandleFilter or close < open
+
+var int lastEntryBar = na
+cooldownPass = na(lastEntryBar) or bar_index - lastEntryBar >= entryCooldownBars
+
+entryFilterLong = trendPassLong and candlePassLong and volPass and distancePass and cooldownPass
+entryFilterShort = trendPassShort and candlePassShort and volPass and distancePass and cooldownPass
+
 // === 入场与止损状态 ===
 var int addCount = 0
 var float longStop = na
@@ -105,10 +135,10 @@ shortStopCandidate = shortRelHigh + stopBufferATR * atr
 baseQty = close > 0 ? baseOrderUSD / close : 0.0
 addQty  = close > 0 ? addOrderUSD / close : 0.0
 
-longEntry = bullSignal and longVegasOK
-shortEntry = bearSignal and shortVegasOK
-longAdd = enableAdd and bullAddSignal and longVegasOK and strategy.position_size > 0 and addCount < maxAdds
-shortAdd = enableAdd and bearAddSignal and shortVegasOK and strategy.position_size < 0 and addCount < maxAdds
+longEntry = bullSignal and longVegasOK and entryFilterLong
+shortEntry = bearSignal and shortVegasOK and entryFilterShort
+longAdd = enableAdd and bullAddSignal and longVegasOK and entryFilterLong and strategy.position_size > 0 and addCount < maxAdds
+shortAdd = enableAdd and bearAddSignal and shortVegasOK and entryFilterShort and strategy.position_size < 0 and addCount < maxAdds
 
 // === 开仓与反手 ===
 if longEntry
@@ -117,6 +147,7 @@ if longEntry
     strategy.entry("Long", strategy.long, qty=baseQty, comment="Long Start")
     longStop := na(longStop) ? longStopCandidate : math.max(longStop, longStopCandidate)
     addCount := 0
+    lastEntryBar := bar_index
 
 if shortEntry
     if closeOnFlip and strategy.position_size > 0
@@ -124,16 +155,19 @@ if shortEntry
     strategy.entry("Short", strategy.short, qty=baseQty, comment="Short Start")
     shortStop := na(shortStop) ? shortStopCandidate : math.min(shortStop, shortStopCandidate)
     addCount := 0
+    lastEntryBar := bar_index
 
 if longAdd
     strategy.entry("Long", strategy.long, qty=addQty, comment="Long Add")
     longStop := na(longStop) ? longStopCandidate : math.max(longStop, longStopCandidate)
     addCount += 1
+    lastEntryBar := bar_index
 
 if shortAdd
     strategy.entry("Short", strategy.short, qty=addQty, comment="Short Add")
     shortStop := na(shortStop) ? shortStopCandidate : math.min(shortStop, shortStopCandidate)
     addCount += 1
+    lastEntryBar := bar_index
 
 // === 持仓管理：相对低点/高点止损 + RR止盈 ===
 if strategy.position_size > 0
