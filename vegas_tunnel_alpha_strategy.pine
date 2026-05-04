@@ -1,0 +1,246 @@
+//@version=6
+strategy("VEGAS Alpha 隧道策略（趋势回撤 + 相对低点止损）", overlay=true, pyramiding=2, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.05, process_orders_on_close=true)
+
+// === ① Vegas 核心参数 ===
+groupVegas = "① Vegas Core"
+emaFastLen = input.int(12, "快线 EMA", minval=2, group=groupVegas)
+emaTriggerLen = input.int(34, "触发 EMA", minval=2, group=groupVegas)
+emaTunnel1Len = input.int(144, "隧道 EMA1", minval=2, group=groupVegas)
+emaTunnel2Len = input.int(169, "隧道 EMA2", minval=2, group=groupVegas)
+emaLong1Len = input.int(576, "远期 EMA1", minval=2, group=groupVegas)
+emaLong2Len = input.int(676, "远期 EMA2", minval=2, group=groupVegas)
+
+// === ② 趋势质量过滤 ===
+groupFilter = "② Trend Filter"
+atrLen = input.int(14, "ATR 周期", minval=2, group=groupFilter)
+adxLen = input.int(14, "ADX 周期", minval=2, group=groupFilter)
+minAdx = input.float(18.0, "最小 ADX", step=0.5, group=groupFilter)
+slopeLookback = input.int(10, "隧道斜率回看", minval=1, group=groupFilter)
+minSlopeATR = input.float(0.18, "最小斜率(ATR)", step=0.01, group=groupFilter)
+minTunnelWidthATR = input.float(0.08, "最小隧道宽度(ATR)", step=0.01, group=groupFilter)
+useHTF = input.bool(true, "启用高周期同向过滤", group=groupFilter)
+htfTf = input.timeframe("240", "高周期", group=groupFilter)
+
+// === ③ 入场逻辑 ===
+groupEntry = "③ Entry Logic"
+usePullbackEntry = input.bool(true, "启用回踩入场", group=groupEntry)
+useBreakoutEntry = input.bool(true, "启用突破入场", group=groupEntry)
+breakoutLookback = input.int(20, "突破回看K数", minval=2, group=groupEntry)
+retestToleranceATR = input.float(0.35, "回踩容差(ATR)", step=0.05, group=groupEntry)
+maxExtATR = input.float(2.8, "最大追价距离(ATR)", step=0.1, group=groupEntry)
+rsiLen = input.int(14, "RSI 周期", minval=2, group=groupEntry)
+rsiLongMin = input.int(52, "多头最小 RSI", minval=1, maxval=99, group=groupEntry)
+rsiShortMax = input.int(48, "空头最大 RSI", minval=1, maxval=99, group=groupEntry)
+entryCooldownBars = input.int(2, "入场冷却K数", minval=0, maxval=100, group=groupEntry)
+
+// === ④ 仓位与加仓 ===
+groupPos = "④ Position"
+riskPct = input.float(0.6, "单笔风险(%)", minval=0.1, maxval=5.0, step=0.1, group=groupPos)
+maxPosUSD = input.float(3000, "最大仓位金额(USD)", minval=100, step=100, group=groupPos)
+minRiskAtrMult = input.float(0.35, "最小风险距离(ATR)", minval=0.1, maxval=3.0, step=0.05, group=groupPos)
+enableAdd = input.bool(true, "允许加仓", group=groupPos)
+maxAdds = input.int(1, "最多加仓次数", minval=0, maxval=10, group=groupPos)
+addQtyFactor = input.float(0.5, "加仓仓位系数", minval=0.1, maxval=2.0, step=0.1, group=groupPos)
+addOnlyInProfit = input.bool(true, "仅盈利时加仓", group=groupPos)
+closeOnFlip = input.bool(true, "反向信号反手", group=groupPos)
+
+// === ⑤ 相对低点止损 + 分批止盈 ===
+groupRisk = "⑤ Risk & Exit"
+swingLookback = input.int(10, "相对低/高点回看", minval=2, maxval=200, group=groupRisk)
+stopBufferATR = input.float(0.2, "止损缓冲(ATR)", minval=0.0, maxval=3.0, step=0.05, group=groupRisk)
+tp1RR = input.float(1.2, "TP1 (R)", minval=0.5, maxval=10, step=0.1, group=groupRisk)
+tp2RR = input.float(2.8, "TP2 (R)", minval=0.8, maxval=20, step=0.1, group=groupRisk)
+breakEvenR = input.float(1.0, "保本触发(R)", minval=0.2, maxval=10, step=0.1, group=groupRisk)
+trailTriggerR = input.float(1.5, "追踪触发(R)", minval=0.5, maxval=20, step=0.1, group=groupRisk)
+trailLookback = input.int(8, "追踪回看K数", minval=2, maxval=100, group=groupRisk)
+trailAtrMult = input.float(2.0, "追踪止损(ATR)", minval=0.2, maxval=10, step=0.1, group=groupRisk)
+
+// === 指标计算 ===
+emaFast = ta.ema(close, emaFastLen)
+emaTrigger = ta.ema(close, emaTriggerLen)
+emaTunnel1 = ta.ema(close, emaTunnel1Len)
+emaTunnel2 = ta.ema(close, emaTunnel2Len)
+emaLong1 = ta.ema(close, emaLong1Len)
+emaLong2 = ta.ema(close, emaLong2Len)
+tunnelTop = math.max(emaTunnel1, emaTunnel2)
+tunnelBottom = math.min(emaTunnel1, emaTunnel2)
+tunnelMid = (emaTunnel1 + emaTunnel2) / 2.0
+
+atr = ta.atr(atrLen)
+atrSafe = math.max(atr, syminfo.mintick)
+[_, __, adx] = ta.dmi(adxLen, adxLen)
+rsi = ta.rsi(close, rsiLen)
+
+tunnelSlope = atrSafe > 0 ? (tunnelMid - tunnelMid[slopeLookback]) / atrSafe : 0.0
+tunnelWidthATR = atrSafe > 0 ? math.abs(emaTunnel1 - emaTunnel2) / atrSafe : 0.0
+
+htfClose = request.security(syminfo.tickerid, htfTf, close)
+htfE1 = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaTunnel1Len))
+htfE2 = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaTunnel2Len))
+htfBull = not useHTF or (htfClose > math.max(htfE1, htfE2) and htfE1 > htfE2)
+htfBear = not useHTF or (htfClose < math.min(htfE1, htfE2) and htfE1 < htfE2)
+
+trendOrderBull = emaFast > emaTrigger and emaTrigger > tunnelTop and emaTunnel1 > emaTunnel2
+trendOrderBear = emaFast < emaTrigger and emaTrigger < tunnelBottom and emaTunnel1 < emaTunnel2
+
+regimeBull = trendOrderBull and close > tunnelTop and adx >= minAdx and tunnelSlope >= minSlopeATR and tunnelWidthATR >= minTunnelWidthATR and htfBull
+regimeBear = trendOrderBear and close < tunnelBottom and adx >= minAdx and tunnelSlope <= -minSlopeATR and tunnelWidthATR >= minTunnelWidthATR and htfBear
+
+extATR = atrSafe > 0 ? math.abs(close - tunnelMid) / atrSafe : 0.0
+notOverExtended = extATR <= maxExtATR
+
+pullbackZoneLong = low <= (tunnelTop + atrSafe * retestToleranceATR) and close > tunnelMid
+pullbackZoneShort = high >= (tunnelBottom - atrSafe * retestToleranceATR) and close < tunnelMid
+
+momentumLong = close > open and close > emaFast and rsi >= rsiLongMin
+momentumShort = close < open and close < emaFast and rsi <= rsiShortMax
+
+pullbackLong = usePullbackEntry and regimeBull and pullbackZoneLong and momentumLong and notOverExtended
+pullbackShort = usePullbackEntry and regimeBear and pullbackZoneShort and momentumShort and notOverExtended
+
+breakoutLong = useBreakoutEntry and regimeBull and close > ta.highest(high, breakoutLookback)[1] and notOverExtended and rsi >= rsiLongMin
+breakoutShort = useBreakoutEntry and regimeBear and close < ta.lowest(low, breakoutLookback)[1] and notOverExtended and rsi <= rsiShortMax
+
+rawLongSignal = pullbackLong or breakoutLong
+rawShortSignal = pullbackShort or breakoutShort
+
+// === 冷却控制 ===
+var int lastEntryBar = na
+cooldownPass = na(lastEntryBar) or bar_index - lastEntryBar >= entryCooldownBars
+
+// === 相对低点/高点止损参考 ===
+longStopRef = ta.lowest(low, swingLookback) - atrSafe * stopBufferATR
+shortStopRef = ta.highest(high, swingLookback) + atrSafe * stopBufferATR
+
+calcQty(_stopRef) =>
+    riskCash = strategy.equity * (riskPct / 100.0)
+    riskDist = math.max(math.abs(close - _stopRef), atrSafe * minRiskAtrMult)
+    qtyRisk = riskDist > 0 ? riskCash / riskDist : 0.0
+    qtyCap = close > 0 ? maxPosUSD / close : 0.0
+    math.max(0.0, math.min(qtyRisk, qtyCap))
+
+longQty = calcQty(longStopRef)
+shortQty = calcQty(shortStopRef)
+longAddQty = longQty * addQtyFactor
+shortAddQty = shortQty * addQtyFactor
+
+// === 持仓状态 ===
+var int addCount = 0
+var float longStop = na
+var float shortStop = na
+var float longInitRisk = na
+var float shortInitRisk = na
+var bool longTp1Hit = false
+var bool shortTp1Hit = false
+
+longEntry = rawLongSignal and cooldownPass and strategy.position_size <= 0
+shortEntry = rawShortSignal and cooldownPass and strategy.position_size >= 0
+
+longAdd = enableAdd and strategy.position_size > 0 and addCount < maxAdds and cooldownPass and pullbackLong and (not addOnlyInProfit or close > strategy.position_avg_price)
+shortAdd = enableAdd and strategy.position_size < 0 and addCount < maxAdds and cooldownPass and pullbackShort and (not addOnlyInProfit or close < strategy.position_avg_price)
+
+if longEntry and longQty > 0
+    if closeOnFlip and strategy.position_size < 0
+        strategy.close("Short", comment="Flip -> Long")
+    strategy.entry("Long", strategy.long, qty=longQty, comment="Long")
+    longStop := longStopRef
+    longInitRisk := math.max(close - longStopRef, atrSafe * minRiskAtrMult)
+    longTp1Hit := false
+    shortStop := na
+    shortInitRisk := na
+    shortTp1Hit := false
+    addCount := 0
+    lastEntryBar := bar_index
+
+if shortEntry and shortQty > 0
+    if closeOnFlip and strategy.position_size > 0
+        strategy.close("Long", comment="Flip -> Short")
+    strategy.entry("Short", strategy.short, qty=shortQty, comment="Short")
+    shortStop := shortStopRef
+    shortInitRisk := math.max(shortStopRef - close, atrSafe * minRiskAtrMult)
+    shortTp1Hit := false
+    longStop := na
+    longInitRisk := na
+    longTp1Hit := false
+    addCount := 0
+    lastEntryBar := bar_index
+
+if longAdd and longAddQty > 0
+    strategy.entry("Long", strategy.long, qty=longAddQty, comment="Long Add")
+    longStop := na(longStop) ? longStopRef : math.max(longStop, longStopRef)
+    addCount += 1
+    lastEntryBar := bar_index
+
+if shortAdd and shortAddQty > 0
+    strategy.entry("Short", strategy.short, qty=shortAddQty, comment="Short Add")
+    shortStop := na(shortStop) ? shortStopRef : math.min(shortStop, shortStopRef)
+    addCount += 1
+    lastEntryBar := bar_index
+
+// === 出场管理 ===
+if strategy.position_size > 0
+    longStop := na(longStop) ? longStopRef : math.max(longStop, longStopRef)
+    if na(longInitRisk)
+        longInitRisk := math.max(strategy.position_avg_price - longStop, atrSafe * minRiskAtrMult)
+    longTp1 = strategy.position_avg_price + longInitRisk * tp1RR
+    longTp2 = strategy.position_avg_price + longInitRisk * tp2RR
+    if high >= longTp1
+        longTp1Hit := true
+    if high >= strategy.position_avg_price + longInitRisk * breakEvenR
+        longStop := math.max(longStop, strategy.position_avg_price)
+    if longTp1Hit or high >= strategy.position_avg_price + longInitRisk * trailTriggerR
+        trailStop = ta.highest(high, trailLookback) - atrSafe * trailAtrMult
+        longStop := math.max(longStop, trailStop)
+    strategy.exit("L-TP1", from_entry="Long", stop=longStop, limit=longTp1, qty_percent=50, comment="L TP1/SL")
+    strategy.exit("L-TP2", from_entry="Long", stop=longStop, limit=longTp2, qty_percent=50, comment="L TP2/SL")
+
+if strategy.position_size < 0
+    shortStop := na(shortStop) ? shortStopRef : math.min(shortStop, shortStopRef)
+    if na(shortInitRisk)
+        shortInitRisk := math.max(shortStop - strategy.position_avg_price, atrSafe * minRiskAtrMult)
+    shortTp1 = strategy.position_avg_price - shortInitRisk * tp1RR
+    shortTp2 = strategy.position_avg_price - shortInitRisk * tp2RR
+    if low <= shortTp1
+        shortTp1Hit := true
+    if low <= strategy.position_avg_price - shortInitRisk * breakEvenR
+        shortStop := math.min(shortStop, strategy.position_avg_price)
+    if shortTp1Hit or low <= strategy.position_avg_price - shortInitRisk * trailTriggerR
+        trailStop = ta.lowest(low, trailLookback) + atrSafe * trailAtrMult
+        shortStop := math.min(shortStop, trailStop)
+    strategy.exit("S-TP1", from_entry="Short", stop=shortStop, limit=shortTp1, qty_percent=50, comment="S TP1/SL")
+    strategy.exit("S-TP2", from_entry="Short", stop=shortStop, limit=shortTp2, qty_percent=50, comment="S TP2/SL")
+
+if strategy.position_size == 0
+    addCount := 0
+    longStop := na
+    shortStop := na
+    longInitRisk := na
+    shortInitRisk := na
+    longTp1Hit := false
+    shortTp1Hit := false
+
+// === 图形 ===
+plot(emaFast, "EMA Fast", color=color.orange)
+plot(emaTrigger, "EMA Trigger", color=color.yellow)
+plot(emaTunnel1, "EMA 144", color=color.new(color.blue, 0))
+plot(emaTunnel2, "EMA 169", color=color.new(color.green, 0))
+plot(emaLong1, "EMA 576", color=color.new(color.gray, 55))
+plot(emaLong2, "EMA 676", color=color.new(color.gray, 55))
+
+fill(plot(emaTunnel1, display=display.none), plot(emaTunnel2, display=display.none), color=color.new(color.teal, 88), title="Vegas Tunnel")
+fill(plot(emaLong1, display=display.none), plot(emaLong2, display=display.none), color=color.new(color.gray, 92), title="Long Channel")
+
+plot(strategy.position_size > 0 ? longStop : na, "Long Relative Stop", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortStop : na, "Short Relative Stop", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+bgcolor(regimeBull ? color.new(color.green, 92) : regimeBear ? color.new(color.red, 92) : na)
+
+plotshape(longEntry, title="Long Entry", style=shape.labelup, location=location.belowbar, color=color.green, text="Long", textcolor=color.white, size=size.small)
+plotshape(shortEntry, title="Short Entry", style=shape.labeldown, location=location.abovebar, color=color.red, text="Short", textcolor=color.white, size=size.small)
+plotshape(longAdd, title="Long Add", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(shortAdd, title="Short Add", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+alertcondition(longEntry, "Long Entry Alert", "Vegas Alpha: Long Entry")
+alertcondition(shortEntry, "Short Entry Alert", "Vegas Alpha: Short Entry")
+alertcondition(longAdd, "Long Add Alert", "Vegas Alpha: Long Add")
+alertcondition(shortAdd, "Short Add Alert", "Vegas Alpha: Short Add")
